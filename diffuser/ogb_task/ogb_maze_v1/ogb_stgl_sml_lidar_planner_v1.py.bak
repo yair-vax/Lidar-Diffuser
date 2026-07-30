@@ -1,0 +1,174 @@
+"""
+LiDAR-aware closed-loop rollout planner for the CompDiffuser giant-antmaze model.
+
+This is the rollout counterpart of the LiDAR *trainer* subclass
+(``OgB_Stgl_Sml_Lidar_Trainer_v1``). The base planner
+(``OgB_Stgl_Sml_MazeEnvPlanner_V1``) assumes the diffusion model thinks in
+``(x, y)``; here the planner observation is a 30-beam LiDAR scan and the
+inverse-dynamics model consumes the 34-D ``[x, y, cos(yaw), sin(yaw), lidar]``
+composite. We bridge live MuJoCo state -> LiDAR by ray-casting against the maze
+with the same simulator used to materialize the training dataset.
+
+Everything about the video machinery (``env.render`` -> ``save_imgs_to_mp4``) is
+observation-space agnostic and inherited unchanged: once we emit valid actions,
+the ``.mp4`` and ``00_rollout.json`` fall out for free.
+
+The full design rationale lives in ``LIDAR_ROLLOUT_VIDEO_TODO.md`` (repo root).
+"""
+
+import numpy as np
+
+import diffuser.utils as utils
+from diffuser.utils import load_config
+from diffuser.datasets.normalization import DatasetNormalizer
+from diffuser.datasets.lidar.lidar_sim import make_scanner_for_env, obs_to_xy_yaw
+from diffuser.ogb_task.ogb_maze_v1.ogb_stgl_sml_planner_v1 import (
+    OgB_Stgl_Sml_MazeEnvPlanner_V1,
+)
+
+## number of leading [x, y, cos(yaw), sin(yaw)] channels in the inv-dyn obs
+N_XYO = 4
+
+
+class OgB_Stgl_Sml_Lidar_MazeEnvPlanner_V1(OgB_Stgl_Sml_MazeEnvPlanner_V1):
+    """Closed-loop rollout for the LiDAR giant-antmaze planner."""
+
+    # -- setup -------------------------------------------------------------#
+    def setup_load(self, ld_config):
+        super().setup_load(ld_config)
+
+        ## The planner observation is the 30-D LiDAR scan, NOT the 2-D (x, y)
+        ## placeholder ``obs_select_dim=(0, 1)`` carried by the LiDAR config.
+        ## ``dfu_ndim`` controls the width of the fused-plan buffer, so it must
+        ## be the true plan dimension (== diffusion observation_dim).
+        self.dfu_ndim = self.diffusion.observation_dim
+
+        ## Build the LiDAR simulator from the planner's lidar_config (same geometry
+        ## that produced the training scans).
+        self.lidar_config = self.args_train.dataset_config['lidar_config']
+        self.scanner = make_scanner_for_env(self.env.name, self.lidar_config)
+
+        ## Goal-scan heading: a LiDAR scan is orientation dependent but the eval
+        ## problems only give a goal *position*. ``args.lidar_goal_yaw`` is either
+        ## a fixed float (default 0.0 -- simplest, deterministic, see §4 of the
+        ## TODO) or the string 'goal' to use the goal state's own heading (gl_pos
+        ## is a full obs, so it carries a quaternion).
+        self.goal_scan_yaw = getattr(self.args, 'lidar_goal_yaw', 0.0)
+
+        assert self.dfu_ndim == self.full_normalizer.normalizers['observations'].mins.shape[0] - N_XYO, \
+            'planner LiDAR dim must equal (inv-dyn obs dim - 4)'
+
+        utils.print_color(
+            f'[lidar planner] dfu_ndim={self.dfu_ndim} goal_scan_yaw={self.goal_scan_yaw} '
+            f'scanner={self.scanner.config_dict()}', c='c')
+
+    # -- normalizers -------------------------------------------------------#
+    def _setup_normalizers(self):
+        """Load the real LiDAR dataset normalizers instead of the hard-coded
+        (x, y) ones.
+
+        ``full_normalizer`` is the inverse-dynamics dataset normalizer: 34-D
+        ``[x, y, cos, sin, lidar]`` observations + 8-D actions. It is rebuilt
+        from the inv-dyn run's saved ``dataset_config.pkl`` so it matches
+        training exactly (the expensive LiDAR ray-casting is disk-cached).
+
+        ``train_normalizer`` (the planner's 30-D LiDAR normalizer, also the
+        normalizer the policy uses) is the LiDAR slice ``[4:]`` of the inv-dyn
+        observation normalizer. Because both datasets are built from the *same*
+        transitions with the *same* LiDAR scans (see ogb_sequence_dataset), this
+        slice is bit-for-bit the planner's own LiDAR normalizer -- which also
+        guarantees a generated plan waypoint is a valid inv-dyn goal.
+        """
+        inv_path = getattr(self.args, 'inv_model_path', None)
+        assert inv_path is not None, (
+            'LiDAR rollout needs args.inv_model_path set to the LiDAR inv-dyn run '
+            'dir (see the dfu_ndim==30 / lidar branch in plan_ogb_stgl_sml.py).')
+
+        utils.print_color(
+            f'[lidar planner] building inv-dyn normalizer from dataset of {inv_path}', c='c')
+        inv_dataset = load_config(inv_path, 'dataset_config.pkl')()
+        self.full_normalizer = inv_dataset.normalizer
+
+        obs_dim = self.full_normalizer.normalizers['observations'].mins.shape[0]
+        lidar_idxs = tuple(range(N_XYO, obs_dim))  ## [4 .. obs_dim)
+        self.train_normalizer = self._slice_obs_normalizer(self.full_normalizer, lidar_idxs)
+
+        ## free the (large) dataset; we only needed its normalizer
+        try:
+            del inv_dataset
+        except Exception:  # noqa: BLE001
+            pass
+
+        self.check_is_same_nmlizer()
+
+    def _slice_obs_normalizer(self, full_norm, obs_idxs):
+        """Return a DatasetNormalizer whose 'observations' normalizer is the
+        ``obs_idxs`` slice of ``full_norm``'s observation normalizer (actions
+        carried over unchanged). For LimitsNormalizer this exactly reproduces a
+        normalizer fit on that observation slice."""
+        obs_n = full_norm.normalizers['observations']
+        act_n = full_norm.normalizers['actions']
+        obs_idxs = list(obs_idxs)
+        data_dict = {
+            'observations': np.stack([obs_n.mins[obs_idxs], obs_n.maxs[obs_idxs]]).astype(np.float32),
+            'actions': np.stack([act_n.mins, act_n.maxs]).astype(np.float32),
+        }
+        ## eval_solo=True -> build straight from the [min; max] rows (no path flatten)
+        return DatasetNormalizer(data_dict, type(obs_n).__name__, eval_solo=True)
+
+    def check_is_same_nmlizer(self):
+        """The planner's 30-D LiDAR normalizer must equal the LiDAR slice
+        ``[4:]`` of the 34-D inv-dyn normalizer (true by construction here)."""
+        tr = self.train_normalizer.normalizers['observations']
+        fl = self.full_normalizer.normalizers['observations']
+        n = tr.mins.shape[0]
+        assert np.allclose(tr.mins, fl.mins[N_XYO:N_XYO + n]) and \
+               np.allclose(tr.maxs, fl.maxs[N_XYO:N_XYO + n]), \
+            'planner LiDAR normalizer != inv-dyn LiDAR slice'
+
+    # -- live obs -> LiDAR helpers ----------------------------------------#
+    def _obs_xy_yaw(self, obs):
+        xy, yaw = obs_to_xy_yaw(obs[None], has_quat=True)
+        return float(xy[0, 0]), float(xy[0, 1]), float(yaw[0])
+
+    def _obs_to_scan(self, obs):
+        """live 29-D ant obs -> (30,) LiDAR scan at the real heading."""
+        x, y, yaw = self._obs_xy_yaw(obs)
+        return self.scanner.scan(x, y, yaw).astype(np.float32)
+
+    def _obs_to_invdyn_obs(self, obs):
+        """live 29-D ant obs -> (34,) [x, y, cos(yaw), sin(yaw), lidar...]."""
+        x, y, yaw = self._obs_xy_yaw(obs)
+        lidar = self.scanner.scan(x, y, yaw)
+        return np.concatenate(
+            [[x, y, np.cos(yaw), np.sin(yaw)], lidar]).astype(np.float32)
+
+    def _goal_scan(self, gl_pos):
+        """goal *position* -> (30,) goal LiDAR scan at the chosen yaw."""
+        gx, gy = float(gl_pos[0]), float(gl_pos[1])
+        yaw_mode = self.goal_scan_yaw
+        if isinstance(yaw_mode, str):
+            if yaw_mode == 'goal':
+                ## gl_pos is a full obs -> use the goal state's real heading
+                _, yaw = obs_to_xy_yaw(np.asarray(gl_pos)[None], has_quat=True)
+                yaw = float(yaw[0])
+            else:
+                raise NotImplementedError(f'lidar_goal_yaw={yaw_mode!r}')
+        else:
+            yaw = float(yaw_mode)
+        return self.scanner.scan(gx, gy, yaw).astype(np.float32)
+
+    # -- overridden hooks --------------------------------------------------#
+    def _get_planner_stgl_input(self, obs_cur, gl_pos):
+        ## condition the diffusion planner on the start scan and the goal scan
+        return self._obs_to_scan(obs_cur), self._goal_scan(gl_pos)
+
+    def _get_invdyn_obs_nm(self, obs_cur):
+        ## the inv-dyn consumes the 34-D composite, normalized by full_normalizer
+        invdyn_obs = self._obs_to_invdyn_obs(obs_cur)
+        return self.full_normalizer.normalize(invdyn_obs, 'observations')
+
+    def _get_subgoal_log_dist(self, obs_cur, goal_cur):
+        ## LiDAR-space distance between the current scan and the subgoal scan
+        ## (the (x, y) slice used by the base would be two beam distances here)
+        return float(np.linalg.norm(self._obs_to_scan(obs_cur) - goal_cur))
