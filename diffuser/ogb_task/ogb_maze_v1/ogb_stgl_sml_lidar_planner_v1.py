@@ -477,6 +477,7 @@ class OgB_Stgl_Sml_Lidar_MazeEnvPlanner_V1(OgB_Stgl_Sml_MazeEnvPlanner_V1):
             return dict(cell=true_cell, xy=(float(gxy_true[0]), float(gxy_true[1])),
                         true_cell=true_cell, cell_err=0, hyps=[], true_rank=0,
                         band_tail=None)
+        self._nav_goal_band_yaw = None                            # set by _goal_scan[_band]*
         band = self._goal_scan_band(np.asarray(gl_pos))          # (K, nb) pure LiDAR
         if band.shape[0] > 1:
             r = self.loc.localize_sequence(
@@ -488,35 +489,177 @@ class OgB_Stgl_Sml_Lidar_MazeEnvPlanner_V1(OgB_Stgl_Sml_MazeEnvPlanner_V1):
             r = self.loc.localize_single(band[0], return_belief=True)
             belief = r['belief']
             gx, gy = float(r['xy'][0]), float(r['xy'][1])
+
+        ## orientation lock (2026-07-30): the goal band's anchor frame was rendered
+        ## at a KNOWN real heading (self._nav_goal_band_yaw), even though the model
+        ## itself never sees x/y/yaw -- the CODE building the descriptor knows it.
+        ## A decoy room that only aliases the goal at a DIFFERENT heading (the
+        ## dominant failure mode found in the 2026-07-30 investigation: a room
+        ## rotated 90deg from the goal matches almost perfectly, but only at that
+        ## specific relative rotation) has no business competing once candidates
+        ## are restricted to poses at the SAME orientation the descriptor was
+        ## actually recorded at. LIDAR_ORIENT_LOCK_WINDOW widens the allowed band
+        ## by that many theta bins each side (0 = exact bin only).
+        locked_belief = None
+        band_yaw = self._nav_goal_band_yaw
+        if band_yaw is not None:
+            n_theta = self.loc_grid.n_theta
+            bin_width = 2.0 * np.pi / n_theta
+            ti0 = int(np.round(((band_yaw - self.loc_grid.theta0) % (2 * np.pi))
+                                / bin_width)) % n_theta
+            window = int(os.environ.get('LIDAR_ORIENT_LOCK_WINDOW', '0'))
+            allowed = sorted({(ti0 + d) % n_theta for d in range(-window, window + 1)})
+            mask = np.isin(self.loc.ti, np.asarray(allowed))
+            b = np.asarray(belief, dtype=np.float64)
+            b_masked = np.where(mask, b, 0.0)
+            if b_masked.sum() > 1e-30:
+                locked_belief = b_masked / b_masked.sum()
+        orient_lock_on = os.environ.get('LIDAR_ORIENT_LOCK', '0') == '1'
+        belief_for_rank = belief
+        if orient_lock_on and locked_belief is not None:
+            belief_for_rank = locked_belief
+            k = int(np.argmax(locked_belief))
+            gx, gy = float(self.loc.grid.free_xy[k, 0]), float(self.loc.grid.free_xy[k, 1])
+
         cell = self.loc_grid.cell_of_xy(gx, gy)
         err = abs(cell[0] - true_cell[0]) + abs(cell[1] - true_cell[1])
         ## TOP-K goal-posterior cells (mass aggregated per maze cell) + true rank.
         k_top = int(getattr(self, '_nav_topk', 5))
-        try:
-            hyps = self._goal_posterior_cells(belief, k=max(k_top, 1))
-        except Exception as e:  # noqa: BLE001  (diagnostic must never break a rollout)
-            hyps = []
-            utils.print_color(f'[gridnav/topk] posterior aggregation failed ({e})', c='y')
+        ## fingerprint ranking (2026-07-30, validated fix): a full 12-orientation
+        ## fingerprint at the goal's own (x,y), compared INDEX-ALIGNED (no rotation
+        ## search) against every candidate cell's own 12-orientation fingerprint.
+        ## Diagnostics (fp_rank= below) showed this resolves the dominant failure
+        ## mode -- 90deg-rotated look-alike rooms winning under the old
+        ## sum/peak-of-belief ranking -- putting the true cell at rank 0-2 on all
+        ## 11 problems that previously never ranked it inside the top-K at all.
+        ## When enabled, this REPLACES hyps/cell/xy (what hop-to-next and the
+        ## initial commit actually use), falling back to the belief-based ranking
+        ## only if fingerprint ranking itself errors.
+        hyps = []
+        if os.environ.get('LIDAR_FP_RANK', '0') == '1':
+            try:
+                fp_k = max(k_top, int(getattr(self, '_nav_hop_budget', k_top)) + 1)
+                hyps = self._fingerprint_rank(gl_pos, k=fp_k)
+                if hyps:
+                    gx, gy = hyps[0]['xy']
+                    cell = self.loc_grid.cell_of_xy(gx, gy)
+                    err = abs(cell[0] - true_cell[0]) + abs(cell[1] - true_cell[1])
+            except Exception as e:  # noqa: BLE001
+                hyps = []
+                utils.print_color(f'[gridnav/topk] fingerprint ranking failed '
+                                  f'({e}); falling back to posterior', c='y')
+        if not hyps:
+            try:
+                hyps = self._goal_posterior_cells(belief_for_rank, k=max(k_top, 1))
+            except Exception as e:  # noqa: BLE001  (diagnostic must never break a rollout)
+                hyps = []
+                utils.print_color(f'[gridnav/topk] posterior aggregation failed ({e})', c='y')
         true_rank = next((n for n, h in enumerate(hyps) if h['cell'] == true_cell), -1)
+        ## diagnostic-only (2026-07-30): when the true cell falls outside the
+        ## navigation-facing top-K, search deeper into the SAME posterior to see
+        ## whether it's just-below-the-cutoff or genuinely absent from the
+        ## localizer's ranking entirely. A separate call so `hyps` (what
+        ## hop-to-next actually iterates) is never widened -- this must not
+        ## change navigation behavior, only the log line.
+        deep_rank_str = ''
+        rank_search_depth = int(os.environ.get('LIDAR_RANK_SEARCH_DEPTH', '0'))
+        if true_rank < 0 and rank_search_depth > 0:
+            try:
+                deep_hyps = self._goal_posterior_cells(belief, k=rank_search_depth)
+                deep_rank = next((n for n, h in enumerate(deep_hyps)
+                                   if h['cell'] == true_cell), -1)
+                if deep_rank < 0:
+                    deep_rank_str = f' deep_rank=not-found/{rank_search_depth}'
+                else:
+                    true_score = deep_hyps[deep_rank]['score']
+                    top_score = deep_hyps[0]['score']
+                    deep_rank_str = (f' deep_rank={deep_rank}/{rank_search_depth} '
+                                      f'score={true_score:.4f} vs top={top_score:.4f}')
+            except Exception as e:  # noqa: BLE001
+                deep_rank_str = f' deep_rank_err({e})'
+        ## diagnostic-only (2026-07-30): does ranking cells by PEAK pose likelihood
+        ## instead of SUMMED column mass put the true cell higher? See docstring on
+        ## _goal_posterior_cells. Separate call, `hyps` (what hop-to-next iterates)
+        ## is untouched -- this must not change navigation behavior, only the log.
+        peak_rank_str = ''
+        if os.environ.get('LIDAR_RANK_AGG_COMPARE', '0') == '1':
+            try:
+                peak_depth = max(k_top, int(getattr(self, '_nav_hop_budget', k_top)) + 1, 20)
+                peak_hyps = self._goal_posterior_cells(belief, k=peak_depth, by='peak')
+                peak_rank = next((n for n, h in enumerate(peak_hyps)
+                                   if h['cell'] == true_cell), -1)
+                peak_top_cell = peak_hyps[0]['cell'] if peak_hyps else None
+                peak_rank_str = (f' | peak_rank={"not-found" if peak_rank < 0 else peak_rank}'
+                                  f'/{peak_depth} peak_argmax={peak_top_cell}')
+            except Exception as e:  # noqa: BLE001
+                peak_rank_str = f' | peak_rank_err({e})'
+        ## diagnostic-only (2026-07-30): does restricting candidates to the goal
+        ## band's OWN recorded orientation (see block above) put the true cell
+        ## higher, even when LIDAR_ORIENT_LOCK isn't the active navigation mode?
+        orient_rank_str = ''
+        if os.environ.get('LIDAR_RANK_AGG_COMPARE', '0') == '1':
+            if locked_belief is None:
+                orient_rank_str = ' | orient_rank=no-yaw'
+            else:
+                try:
+                    orient_depth = max(k_top, int(getattr(self, '_nav_hop_budget', k_top)) + 1, 20)
+                    orient_hyps = self._goal_posterior_cells(locked_belief, k=orient_depth)
+                    orient_rank = next((n for n, h in enumerate(orient_hyps)
+                                         if h['cell'] == true_cell), -1)
+                    orient_top_cell = orient_hyps[0]['cell'] if orient_hyps else None
+                    orient_rank_str = (
+                        f' | orient_rank={"not-found" if orient_rank < 0 else orient_rank}'
+                        f'/{orient_depth} orient_argmax={orient_top_cell}')
+                except Exception as e:  # noqa: BLE001
+                    orient_rank_str = f' | orient_rank_err({e})'
+        ## diagnostic-only (2026-07-30, user's proposal): stationary 12-heading
+        ## fingerprint at the goal's own (x,y), index-aligned against every
+        ## candidate's own 12-heading fingerprint (see _fingerprint_rank).
+        fp_rank_str = ''
+        if os.environ.get('LIDAR_RANK_AGG_COMPARE', '0') == '1':
+            try:
+                fp_depth = max(k_top, int(getattr(self, '_nav_hop_budget', k_top)) + 1, 20)
+                fp_hyps = self._fingerprint_rank(gl_pos, k=fp_depth)
+                fp_rank = next((n for n, h in enumerate(fp_hyps)
+                                 if h['cell'] == true_cell), -1)
+                fp_top_cell = fp_hyps[0]['cell'] if fp_hyps else None
+                fp_rank_str = (f' | fp_rank={"not-found" if fp_rank < 0 else fp_rank}'
+                                f'/{fp_depth} fp_argmax={fp_top_cell}')
+            except Exception as e:  # noqa: BLE001
+                fp_rank_str = f' | fp_rank_err({e})'
         if hyps:
             top_str = ', '.join(f"{h['cell']}:{h['score']:.3f}" for h in hyps[:k_top])
             utils.print_color(
                 f"[gridnav/topk] goal-posterior top{k_top}: {top_str} | true={true_cell} "
-                f"rank={'>K' if true_rank < 0 else true_rank} "
-                f"(argmax {cell}, {err} cells off)", c='c')
+                f"rank={'>K' if true_rank < 0 else true_rank}{deep_rank_str} "
+                f"(argmax {cell}, {err} cells off){peak_rank_str}{orient_rank_str}{fp_rank_str}", c='c')
         return dict(cell=cell, xy=(gx, gy), true_cell=true_cell, cell_err=int(err),
                     hyps=hyps, true_rank=int(true_rank),
                     band_tail=np.asarray(band[-1], dtype=np.float32).copy())
 
-    def _goal_posterior_cells(self, belief_flat, k=5):
+    def _goal_posterior_cells(self, belief_flat, k=5, by='sum'):
         """Aggregate a per-free-pose posterior ``belief_flat`` (M,) into per-maze-cell
         scores -- the goal-CELL posterior both the navigator and the arrival detector
-        act on. Theta and every lattice pose inside an OGBench maze cell are summed.
+        act on.
 
-        Each entry: ``dict(cell=(i,j), xy=(x,y), score)`` where ``xy`` is the
-        highest-belief lattice pose in the cell (a routable, sub-cell endpoint) and
-        ``score`` is the aggregated posterior mass. Sorted by score desc and kept a
-        little deeper than ``k`` so verify-and-hop always has fallbacks."""
+        ``by='sum'`` (default, original behavior): mass is SUMMED over every theta bin
+        and every lattice pose inside a cell. This conflates "plausible at many
+        orientations, weakly" with "one sharp, sequence-consistent peak at a single
+        orientation" -- a cell whose true match requires one specific heading (the
+        common case for a room that only aliases the goal when *rotated* some exact
+        amount, see 2026-07-30 aliasing investigation) gets no credit for how sharp
+        that peak is, only for how much total mass happens to land in its column.
+
+        ``by='peak'``: score is the single highest-belief POSE in the cell (the same
+        pose ``localize_sequence`` already treats as MAP-consistent across the whole
+        motion-filtered scan sequence) instead of the column sum. Both scores are
+        always attached to every entry (``score_sum``/``score_peak``) regardless of
+        ``by``, so callers can compare without a second aggregation pass.
+
+        Each entry: ``dict(cell=(i,j), xy=(x,y), score, score_sum, score_peak)`` where
+        ``xy`` is the highest-belief lattice pose in the cell (a routable, sub-cell
+        endpoint). Sorted by ``score`` desc and kept a little deeper than ``k`` so
+        verify-and-hop always has fallbacks."""
         grid = self.loc.grid
         b = np.asarray(belief_flat, dtype=np.float64).reshape(-1)
         b = b / max(b.sum(), 1e-30)
@@ -532,8 +675,10 @@ class OgB_Stgl_Sml_Lidar_MazeEnvPlanner_V1(OgB_Stgl_Sml_MazeEnvPlanner_V1):
         best_pose = np.full(uniq.shape[0], -1, dtype=np.int64)
         order = np.argsort(b, kind='stable')                      # ascending -> last=max
         best_pose[inv[order]] = order
+        peak = np.where(best_pose >= 0, b[np.clip(best_pose, 0, None)], 0.0)
+        score_arr = peak if by == 'peak' else mass
         n_keep = int(max(int(k), int(getattr(self, '_nav_hop_budget', k)) + 1))
-        top = np.argsort(mass)[::-1][:n_keep]
+        top = np.argsort(score_arr)[::-1][:n_keep]
         out = []
         for g in top:
             key = int(uniq[g])
@@ -541,7 +686,68 @@ class OgB_Stgl_Sml_Lidar_MazeEnvPlanner_V1(OgB_Stgl_Sml_MazeEnvPlanner_V1):
             p = int(best_pose[g])
             out.append(dict(cell=(int(i_cell), int(j_cell)),
                             xy=(float(fxy[p, 0]), float(fxy[p, 1])),
-                            score=float(mass[g])))
+                            score=float(score_arr[g]),
+                            score_sum=float(mass[g]), score_peak=float(peak[g])))
+        return out
+
+    def _fingerprint_rank(self, gl_pos, k=200):
+        """(2026-07-30, user's proposal) Rank candidate maze cells by a full
+        12-orientation LiDAR 'fingerprint' comparison, INDEX-ALIGNED -- no
+        rotation search at all, unlike everything above.
+
+        Renders 12 fresh scans at the goal's own (x, y), one per theta bin
+        (0deg, 30deg, ... 330deg) -- a stationary rotational signature of the
+        goal location itself, computed purely from known maze geometry (the
+        model still never sees x, y; this is the same kind of geometry-only
+        synthesis the non-teacher-forced single-scan path already does). Every
+        grid lattice point already has its own such 12-scan fingerprint
+        precomputed in ``grid.scans_grid`` (n_row, n_col, n_theta, n_beams).
+        Compares fingerprint[t] to fingerprint[t] for every t in 0..11 (never
+        fingerprint[t] to fingerprint[t'] for t' != t) and sums the 12 per-beam
+        RMS diffs -- so a room that only resembles the goal after a 90deg spin
+        scores 9 of its 12 headings as bad mismatches instead of hiding behind
+        its one best angle. Lower total = better match; unlike
+        ``_goal_posterior_cells`` (higher score first) this is ascending.
+
+        Returns up to ``k`` entries, sorted ascending by ``score`` (the summed
+        12-heading diff), each cell appearing once (its own best lattice
+        point)."""
+        grid = self.loc_grid
+        gx, gy = float(gl_pos[0]), float(gl_pos[1])
+        goal_fp = np.stack([self.scanner.scan(gx, gy, float(th)).astype(np.float32)
+                             for th in grid.theta_vals])              # (n_theta, nb)
+        sg = np.asarray(grid.scans_grid, dtype=np.float32)            # (n_row,n_col,n_theta,nb)
+        with np.errstate(invalid='ignore'):
+            diff = np.sqrt(np.nanmean((sg - goal_fp[None, None]) ** 2, axis=-1))  # (row,col,theta)
+            total = np.nansum(diff, axis=-1)                          # (n_row, n_col)
+        ## NOTE: np.nansum of an all-NaN slice silently returns 0.0 (not NaN), so
+        ## wall (row,col) cells -- every theta NaN -- would otherwise look like a
+        ## perfect 0.000 match instead of being excluded. Use the grid's own
+        ## free/wall mask as ground truth, not NaN-ness of `total` (2026-07-30 bug
+        ## caught in local sanity check before the cluster run).
+        free = np.asarray(grid.free_mask_xy, dtype=bool)
+        rows, cols = np.nonzero(free)
+        if rows.size == 0:
+            return []
+        xs = grid.x_vals[cols].astype(np.float64)
+        ys = grid.y_vals[rows].astype(np.float64)
+        ci, cj = self.scanner.world_to_cell(xs, ys)
+        keys = (np.asarray(ci, dtype=np.int64) + 1000) * 100000 + (np.asarray(cj, dtype=np.int64) + 1000)
+        scores = total[rows, cols]
+        order = np.argsort(scores)                                   # ascending: best first
+        seen = set()
+        out = []
+        for idx in order:
+            key = int(keys[idx])
+            if key in seen:
+                continue
+            seen.add(key)
+            i_cell, j_cell = key // 100000 - 1000, key % 100000 - 1000
+            out.append(dict(cell=(int(i_cell), int(j_cell)),
+                            xy=(float(xs[idx]), float(ys[idx])),
+                            score=float(scores[idx])))
+            if len(out) >= k:
+                break
         return out
 
     def _nav_est_pose(self):
@@ -1307,6 +1513,10 @@ class OgB_Stgl_Sml_Lidar_MazeEnvPlanner_V1(OgB_Stgl_Sml_MazeEnvPlanner_V1):
                 raise NotImplementedError(f'lidar_goal_yaw={yaw_mode!r}')
         else:
             yaw = float(yaw_mode)
+        ## the yaw used to RENDER this scan is known to the code even though the
+        ## model never sees it -- stash it so localization can constrain candidate
+        ## cells to the SAME orientation instead of searching all of them (2026-07-30).
+        self._nav_goal_band_yaw = float(yaw)
         return self.scanner.scan(gx, gy, yaw).astype(np.float32)
 
     def _goal_scan_band(self, gl_pos):
@@ -1412,6 +1622,16 @@ class OgB_Stgl_Sml_Lidar_MazeEnvPlanner_V1(OgB_Stgl_Sml_MazeEnvPlanner_V1):
         if seg.shape[0] < K:                             # pad at the front if clamped
             seg = np.concatenate([np.repeat(seg[:1], K - seg.shape[0], axis=0), seg], axis=0)
         band = self.scanner.scan_obs(seg, has_quat=True).astype(np.float32)   # (K, n_beams)
+        ## the REAL recorded heading of the goal-anchor frame -- known to the code
+        ## (it's how `band`'s last scan was rendered) even though it's never fed to
+        ## the model. Stashed so localization can lock candidate cells to this same
+        ## orientation instead of letting each one pick its own best-fitting theta,
+        ## which is exactly what a 90deg-rotated look-alike room exploits (2026-07-30).
+        try:
+            _, _band_yaws = obs_to_xy_yaw(seg, has_quat=True)
+            self._nav_goal_band_yaw = float(_band_yaws[-1])
+        except Exception:  # noqa: BLE001
+            self._nav_goal_band_yaw = None
         dmj = float(np.sqrt(d2[chosen]))
         span = float(np.linalg.norm(data['xy'][idx[-1]] - data['xy'][idx[0]]))
         utils.print_color(f'[tf_band] goal=({gxy[0]:.2f},{gxy[1]:.2f}) -> frame {chosen} '

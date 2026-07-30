@@ -327,6 +327,9 @@ if __name__ == '__main__':
                 ## Unset (default) -> untouched (0.5mj for non-point mazes).
                 if 'LIDAR_GOAL_TOL' in os.environ:
                     args.goal_tol_override = float(os.environ['LIDAR_GOAL_TOL'])
+                ## fingerprint goal-cell ranking (2026-07-30, validated fix): see
+                ## _fingerprint_rank / LIDAR_FP_RANK in ogb_stgl_sml_lidar_planner_v1.py.
+                args.nav_fp_rank = int(os.environ.get('LIDAR_FP_RANK', '0'))
 
                 utils.print_color(
                     f'[lidar rollout] is_replan={args.is_replan} '
@@ -343,7 +346,8 @@ if __name__ == '__main__':
                     f'nav_stuck_detect={args.nav_stuck_detect} '
                     f'nav_stuck_window={args.nav_stuck_window} '
                     f'nav_stuck_radius={args.nav_stuck_radius} '
-                    f'goal_tol_override={getattr(args, "goal_tol_override", None)}', c='c')
+                    f'goal_tol_override={getattr(args, "goal_tol_override", None)} '
+                    f'nav_fp_rank={args.nav_fp_rank}', c='c')
                 ## LiDAR inverse-dynamics run dir (must exist on disk). Default path
                 ## resolver keys off env+gl_dim and will NOT find this, so set it
                 ## explicitly. Confirm the dir name matches your trained run.
