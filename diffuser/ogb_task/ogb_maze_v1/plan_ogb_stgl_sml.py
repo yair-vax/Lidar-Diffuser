@@ -175,15 +175,31 @@ if __name__ == '__main__':
                 ## current plan is consumed -- helps cross the giant maze, where a
                 ## single H160 plan can't reach the goal. (mode 'periodic', added to
                 ## ogb_stgl_sml_planner_v1.py; scan-space safe, keeps full n_comp.)
+                ##
+                ## LIDAR_REPLAN_MODE selects HOW replans beyond "plan consumed" get
+                ## triggered:
+                ##   'periodic' (default): also force a replan every LIDAR_REPL_EVERY
+                ##     consumed waypoints regardless of progress -- discards the
+                ##     current route and computes a brand new BFS route from scratch
+                ##     even if nothing has gone wrong.
+                ##   'dist_check' (2026-08-01): sticks to ONE route; only replans when
+                ##     the ant's OWN scan-based position estimate drifts more than
+                ##     LIDAR_ADA_DIST_THRES from where the route says it should be
+                ##     (see _lidar_route_deviation) -- never a fixed clock, never
+                ##     ground-truth (x,y).
                 if os.environ.get('LIDAR_REPLAN', '0') == '1':
-                    args.is_replan = 'periodic'
+                    _repl_mode = os.environ.get('LIDAR_REPLAN_MODE', 'periodic').lower()
+                    args.is_replan = 'lidar_dist_check' if _repl_mode == 'dist_check' else 'periodic'
                     args.repl_ada_dist_cfg = dict(
                         n_max_steps=int(os.environ.get('LIDAR_N_MAX_STEPS', '2500')),
                         max_n_repl=int(os.environ.get('LIDAR_MAX_N_REPL', '15')),
                         ## LIDAR_REPL_EVERY=N (>0): also replan every N consumed
                         ## waypoints, not only when the whole plan is used up.
                         ## 0 (default) keeps the original "replan when plan consumed".
+                        ## Only read by 'periodic'; 'dist_check' ignores it entirely.
                         repl_every=int(os.environ.get('LIDAR_REPL_EVERY', '0')),
+                        ## Only read by 'dist_check': deviation threshold, world units.
+                        thres=float(os.environ.get('LIDAR_ADA_DIST_THRES', '4.0')),
                     )
                 else:
                     args.is_replan = False
@@ -327,6 +343,9 @@ if __name__ == '__main__':
                 ## Unset (default) -> untouched (0.5mj for non-point mazes).
                 if 'LIDAR_GOAL_TOL' in os.environ:
                     args.goal_tol_override = float(os.environ['LIDAR_GOAL_TOL'])
+                ## fingerprint goal-cell ranking (2026-07-30, validated fix): see
+                ## _fingerprint_rank / LIDAR_FP_RANK in ogb_stgl_sml_lidar_planner_v1.py.
+                args.nav_fp_rank = int(os.environ.get('LIDAR_FP_RANK', '0'))
 
                 utils.print_color(
                     f'[lidar rollout] is_replan={args.is_replan} '
@@ -343,7 +362,8 @@ if __name__ == '__main__':
                     f'nav_stuck_detect={args.nav_stuck_detect} '
                     f'nav_stuck_window={args.nav_stuck_window} '
                     f'nav_stuck_radius={args.nav_stuck_radius} '
-                    f'goal_tol_override={getattr(args, "goal_tol_override", None)}', c='c')
+                    f'goal_tol_override={getattr(args, "goal_tol_override", None)} '
+                    f'nav_fp_rank={args.nav_fp_rank}', c='c')
                 ## LiDAR inverse-dynamics run dir (must exist on disk). Default path
                 ## resolver keys off env+gl_dim and will NOT find this, so set it
                 ## explicitly. Confirm the dir name matches your trained run.

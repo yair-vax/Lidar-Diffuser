@@ -582,6 +582,19 @@ class OgB_Stgl_Sml_MazeEnvPlanner_V1:
                 tot_hzn = 10000
                 utils.print_color(f'[periodic replan] tot_hzn={tot_hzn} '
                                   f'max_n_repl={self.max_n_repl} repl_every={self.repl_every}', c='c')
+            elif self.is_replan == 'lidar_dist_check':
+                ## LiDAR deviation-check replan (2026-08-01): sticks to ONE route
+                ## for as long as it holds up. No fixed-interval forced reset like
+                ## 'periodic' -- only replans when the plan is actually consumed,
+                ## or the ant's OWN scan-based position estimate has drifted too
+                ## far from where the route currently expects it (see
+                ## _lidar_route_deviation on the LiDAR planner subclass; never
+                ## ground-truth (x,y), same compliance as the rest of the rollout).
+                self.max_n_repl = self.repl_ada_dist_cfg.get('max_n_repl', 15)
+                self.ada_dist_thres = self.repl_ada_dist_cfg.get('thres', 4.0)
+                tot_hzn = 10000
+                utils.print_color(f'[lidar dist-check replan] tot_hzn={tot_hzn} '
+                                  f'max_n_repl={self.max_n_repl} thres={self.ada_dist_thres}', c='c')
             elif self.is_replan == False:
                 tot_hzn = self.get_comp_hzn(self.policy.n_comp)
                 assert self.repl_wp_cfg == {}
@@ -612,7 +625,7 @@ class OgB_Stgl_Sml_MazeEnvPlanner_V1:
 
             
             ## Set Num of Env Steps
-            if self.is_replan in ('ada_dist', 'periodic'):
+            if self.is_replan in ('ada_dist', 'periodic', 'lidar_dist_check'):
                 self.n_max_steps = self.repl_ada_dist_cfg['n_max_steps']
             else:
                 self.n_max_steps = tot_hzn * self.n_act_per_waypnt + self.extra_env_steps
@@ -674,6 +687,25 @@ class OgB_Stgl_Sml_MazeEnvPlanner_V1:
                     _forced = bool(getattr(self, '_nav_force_replan', False))
                     is_do_repl_et = (_consumed or _periodic or _forced) \
                                     and (cnt_repl < self.max_n_repl)
+                elif self.is_replan == 'lidar_dist_check' and i_et > 0:
+                    ## sticks to the current route: replan only when it's
+                    ## actually consumed, a rejected-decoy hop asks for a prompt
+                    ## re-route (same _nav_force_replan signal as 'periodic'), or
+                    ## the ant's own scan-based position estimate has drifted
+                    ## more than ada_dist_thres from where the route says it
+                    ## should be -- no fixed-interval reset.
+                    _wp_since_plan = wp_idx - prev_dfu_wp_idx
+                    _consumed = _wp_since_plan >= len(all_plan_trajs_ep[-1])
+                    _lidar_dev = (self._lidar_route_deviation()
+                                  if hasattr(self, '_lidar_route_deviation') else None)
+                    _deviated = (_lidar_dev is not None) and (_lidar_dev > self.ada_dist_thres)
+                    _forced = bool(getattr(self, '_nav_force_replan', False))
+                    is_do_repl_et = (_consumed or _deviated or _forced) \
+                                    and (cnt_repl < self.max_n_repl)
+                    if _deviated:
+                        utils.print_color(
+                            f'[lidar dist-check] t={i_et} deviation={_lidar_dev:.2f}mj '
+                            f'> thres={self.ada_dist_thres} -> replan', c='y')
                 elif self.is_replan == 'ada_dist' and i_et > 0:
                     
                     ## distance larger than threshold and within repl limit
@@ -754,7 +786,7 @@ class OgB_Stgl_Sml_MazeEnvPlanner_V1:
 
                             self.policy.n_comp = tmp_n_comp
                             # pdb.set_trace()
-                        elif self.is_replan == 'periodic':
+                        elif self.is_replan in ('periodic', 'lidar_dist_check'):
                             ## keep the full composition count -> fresh full-horizon plan
                             self.policy.n_comp = n_comp_full
                         else:
@@ -781,7 +813,7 @@ class OgB_Stgl_Sml_MazeEnvPlanner_V1:
 
                     if self.is_replan == 'at_given_t' and repl_wp_list[-1] == wp_idx: ## if is last repl traj
                         assert tmp_tj_end_idx == len(fused_traj_ep)
-                    elif self.is_replan in ('ada_dist', 'periodic'):
+                    elif self.is_replan in ('ada_dist', 'periodic', 'lidar_dist_check'):
                         ## can add some sanity check
                         pass
                     elif self.is_replan == False:
