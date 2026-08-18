@@ -758,23 +758,48 @@ class OgB_Stgl_Sml_Lidar_MazeEnvPlanner_V1(OgB_Stgl_Sml_MazeEnvPlanner_V1):
     def _lidar_route_deviation(self):
         """Distance between the ant's own scan-based live position estimate
         (``_nav_live.est_xy``) and where the CURRENT route says it should be
-        right now (``_nav_plan_xy`` at ``_nav_cursor``) -- the deviation signal
-        for the 'lidar_dist_check' replan trigger (2026-08-01).
+        right now -- the deviation signal for the 'lidar_dist_check' replan
+        trigger.
 
         Deliberately never touches ground-truth (x, y): both sides come from
-        LiDAR-derived state the system already tracks for pursuit (the same
-        ``est_xy``/snap machinery in ``_nav_pick_wp_idx``), so 'sticks to the
-        plan but checks it's still on it' stays within the same
-        model-never-sees-x/y compliance as the rest of the LiDAR rollout --
-        the check is a controller-level fact about self-localization vs.
-        intended route, not a peek at simulator ground truth."""
+        LiDAR-derived state the system already tracks for pursuit.
+
+        SNAP-GATED (2026-08-17 fix): reuses the exact same sanity check
+        ``_nav_pick_wp_idx`` already applies before trusting ``est_xy`` for
+        cursor correction -- search a local window around the cursor
+        (``_nav_back``/``_nav_win`` frames each way) for the nearest route
+        point to the live estimate, and only trust the estimate if that
+        nearest point is within ``_nav_snap_mj``. Without this, a phantom
+        estimate (a documented, systematic-at-episode-start glitch already
+        worked around in ``_nav_pick_wp_idx`` -- see its docstring, ~50+ mj
+        bogus jumps) reads as a huge, spurious deviation and burns a replan
+        on a false alarm instead of a real course correction. When the
+        estimate fails the snap gate, this returns None (no signal this
+        step) rather than a number that would trigger on the glitch."""
         exy = getattr(self._nav_live, 'est_xy', None)
         xy = getattr(self, '_nav_plan_xy', None)
         cursor = getattr(self, '_nav_cursor', None)
         if exy is None or xy is None or cursor is None or len(xy) == 0:
             return None
-        idx = int(np.clip(int(cursor), 0, len(xy) - 1))
-        return float(np.linalg.norm(np.asarray(exy, dtype=np.float64) - np.asarray(xy[idx], dtype=np.float64)))
+        cursor = int(cursor)
+        n = len(xy)
+        back = int(getattr(self, '_nav_back', 0))
+        win = int(getattr(self, '_nav_win', 0))
+        j0 = max(cursor - back, 0)
+        j1 = min(cursor + win, n)
+        if j1 <= j0:
+            return None
+        exy = np.asarray(exy, dtype=np.float64)
+        window_xy = np.asarray(xy[j0:j1], dtype=np.float64)
+        d = np.linalg.norm(window_xy - exy[None, :], axis=1)
+        jm = int(np.argmin(d))
+        snap_mj = float(getattr(self, '_nav_snap_mj', 0.0))
+        if float(d[jm]) > snap_mj:
+            return None  ## phantom reading -- not trustworthy, skip this step
+        ## trustworthy: distance from the ant's real (estimated) position to
+        ## where the route currently expects it to be, at the cursor
+        idx = int(np.clip(cursor, 0, n - 1))
+        return float(np.linalg.norm(exy - np.asarray(xy[idx], dtype=np.float64)))
 
     def _nav_proprio_yaw(self, st=None):
         """The ant's own heading from the live obs quaternion (obs[3:7]).
