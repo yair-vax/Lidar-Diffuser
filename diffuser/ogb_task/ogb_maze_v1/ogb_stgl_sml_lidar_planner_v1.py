@@ -536,7 +536,29 @@ class OgB_Stgl_Sml_Lidar_MazeEnvPlanner_V1(OgB_Stgl_Sml_MazeEnvPlanner_V1):
         ## initial commit actually use), falling back to the belief-based ranking
         ## only if fingerprint ranking itself errors.
         hyps = []
-        if os.environ.get('LIDAR_FP_RANK', '0') == '1':
+        ## no-orientation ablation (2026-08-19, user's proposal): same 200+-deep
+        ## ranked-hyps contract as _fingerprint_rank, but scores each candidate
+        ## cell by its BEST match over ANY of its own headings to a single goal
+        ## scan -- no per-heading index alignment, no requirement to match at
+        ## every angle. This is exactly the "no orientation" left panel from the
+        ## earlier similarity-map comparison (distance_map_to_target, reduce=
+        ## 'min'); fingerprint ranking (below) was built specifically to replace
+        ## this because it lets 90deg-rotated decoy rooms alias the goal. Takes
+        ## priority over LIDAR_FP_RANK when both are set, so the two are never
+        ## silently mixed.
+        if os.environ.get('LIDAR_NOORIENT_RANK', '0') == '1':
+            try:
+                no_k = max(k_top, int(getattr(self, '_nav_hop_budget', k_top)) + 1)
+                hyps = self._noorient_rank(gl_pos, k=no_k)
+                if hyps:
+                    gx, gy = hyps[0]['xy']
+                    cell = self.loc_grid.cell_of_xy(gx, gy)
+                    err = abs(cell[0] - true_cell[0]) + abs(cell[1] - true_cell[1])
+            except Exception as e:  # noqa: BLE001
+                hyps = []
+                utils.print_color(f'[gridnav/topk] no-orientation ranking failed '
+                                  f'({e}); falling back to posterior', c='y')
+        elif os.environ.get('LIDAR_FP_RANK', '0') == '1':
             try:
                 fp_k = max(k_top, int(getattr(self, '_nav_hop_budget', k_top)) + 1)
                 hyps = self._fingerprint_rank(gl_pos, k=fp_k)
@@ -688,6 +710,50 @@ class OgB_Stgl_Sml_Lidar_MazeEnvPlanner_V1(OgB_Stgl_Sml_MazeEnvPlanner_V1):
                             xy=(float(fxy[p, 0]), float(fxy[p, 1])),
                             score=float(score_arr[g]),
                             score_sum=float(mass[g]), score_peak=float(peak[g])))
+        return out
+
+    def _noorient_rank(self, gl_pos, k=200):
+        """(2026-08-19, ablation, user's proposal) Rank candidate maze cells by
+        the BEST match over ANY of their own 12 headings to a SINGLE goal scan
+        -- the "no orientation" comparison from the earlier similarity-map
+        analysis (GridLocalizer.distance_map_to_target, reduce='min'), kept
+        here only to A/B against _fingerprint_rank with orientation-awareness
+        switched off. A candidate only has to resemble the goal from *some*
+        angle to score well here, so a room that resembles the goal only after
+        being rotated some amount (the failure mode _fingerprint_rank was
+        built to fix) scores just as well as the true cell.
+
+        Returns the same dict(cell, xy, score) shape as _fingerprint_rank,
+        ascending by score (lower = better match), one entry per maze cell
+        (its own best-matching lattice pose)."""
+        grid = self.loc_grid
+        gx, gy = float(gl_pos[0]), float(gl_pos[1])
+        yaw = 0.0 if isinstance(self.goal_scan_yaw, str) else float(self.goal_scan_yaw)
+        goal_scan = self.scanner.scan(gx, gy, yaw).astype(np.float32)
+        dist_xy, _ = self.loc.distance_map_to_target(goal_scan, reduce='min')  # (n_row, n_col)
+        free = np.asarray(grid.free_mask_xy, dtype=bool)
+        rows, cols = np.nonzero(free)
+        if rows.size == 0:
+            return []
+        xs = grid.x_vals[cols].astype(np.float64)
+        ys = grid.y_vals[rows].astype(np.float64)
+        ci, cj = self.scanner.world_to_cell(xs, ys)
+        keys = (np.asarray(ci, dtype=np.int64) + 1000) * 100000 + (np.asarray(cj, dtype=np.int64) + 1000)
+        scores = np.asarray(dist_xy, dtype=np.float64)[rows, cols]
+        order = np.argsort(scores)                                   # ascending: best first
+        seen = set()
+        out = []
+        for idx in order:
+            key = int(keys[idx])
+            if key in seen:
+                continue
+            seen.add(key)
+            i_cell, j_cell = key // 100000 - 1000, key % 100000 - 1000
+            out.append(dict(cell=(int(i_cell), int(j_cell)),
+                            xy=(float(xs[idx]), float(ys[idx])),
+                            score=float(scores[idx])))
+            if len(out) >= k:
+                break
         return out
 
     def _fingerprint_rank(self, gl_pos, k=200):
